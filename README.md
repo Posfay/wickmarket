@@ -8,6 +8,8 @@ The game speaks **English** and **Hungarian (Magyar)**; switch any time with the
 
 ## Run it
 
+**Play online:** <https://posfay.github.io/wickmarket/>
+
 **Easiest — one file, no install:** open `dist/wickmarket.html` in Chrome, Edge or Firefox (double-click it).
 It needs an internet connection the first time, for Three.js (jsDelivr CDN) and the fonts.
 
