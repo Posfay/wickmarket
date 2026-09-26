@@ -1,0 +1,245 @@
+@import url("src/ui/ui.css");
+/* Wickmarket page shell (G2): the canvas, the floating-label layer, the loading card, the headless log
+   and the renderer's debug overlay. All UI panel styling lives in src/ui/ui.css (G6). */
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #2A1C14;
+  color: #EFE6D2;
+}
+
+body {
+  font-family: Georgia, 'Times New Roman', serif;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: radial-gradient(120% 90% at 50% 38%, #3A281C 0%, #2A1C14 55%, #1A110B 100%);
+}
+
+/* The terrarium: always the full viewport; the renderer sizes the drawing buffer. */
+#view {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  outline: none;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Floating world-anchored labels (fx.js). Never intercepts the pointer. */
+#fxlayer {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  overflow: hidden;
+  pointer-events: none;
+  contain: layout style;
+}
+
+#fxlayer * { pointer-events: none; }
+
+/* The UI shell passes clicks through to the canvas except where a panel actually sits. */
+#ui-root { pointer-events: none; }
+#ui-root > * { pointer-events: auto; }
+
+/* Author styles would otherwise beat the UA's [hidden] rule for these two. */
+#loading[hidden],
+#headless-log[hidden],
+#debug-overlay[hidden] { display: none !important; }
+
+/* ------------------------------------------------------------------------------------------------
+   Loading card: a parchment specimen label. main.js sets --p (0..1) on #loading; the bar's inner
+   <i> follows it, and a small candle flame rides the tip. The wide box-shadow veils the half-built
+   scene until the card fades out (.done).
+   ------------------------------------------------------------------------------------------------ */
+#loading {
+  --p: 0;
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  z-index: 50;
+  box-sizing: border-box;
+  width: min(440px, calc(100vw - 48px));
+  padding: 30px 38px 24px;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+  color: #1B1712;
+  text-align: center;
+  background:
+    url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .32 0 0 0 0 .24 0 0 0 0 .12 0 0 0 .1 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"),
+    radial-gradient(130% 110% at 50% 0%, #F7F1E3 0%, #EFE6D2 55%, #E2D5B8 100%);
+  border: 1px solid #B08D57;
+  border-radius: 3px;
+  outline: 1px solid rgba(176, 141, 87, 0.55);
+  outline-offset: -7px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 252, 240, 0.6),
+    0 18px 50px rgba(8, 5, 3, 0.55),
+    0 0 0 100vmax rgba(24, 15, 10, 0.94);
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 0.45s ease, visibility 0s linear 0s, box-shadow 0.45s ease;
+}
+
+#loading::before {
+  content: "Wickmarket";
+  order: 0;
+  font-family: 'IM Fell English SC', Georgia, serif;
+  font-size: 34px;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  color: #1B1712;
+}
+
+#loading::after {
+  content: "A Candlelight Economy Under Glass";
+  order: 1;
+  margin-top: -8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(176, 141, 87, 0.6);
+  font-family: 'IM Fell English SC', Georgia, serif;
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  color: #6B4A2E;
+}
+
+#loading .bar {
+  order: 2;
+  position: relative;
+  height: 10px;
+  margin: 10px 4px 0;
+  border: 1px solid #B08D57;
+  border-radius: 6px;
+  background: linear-gradient(#20150F, #2A1C14);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6), 0 1px 0 rgba(255, 252, 240, 0.5);
+}
+
+#loading .bar i {
+  position: relative;
+  display: block;
+  height: 100%;
+  width: calc(var(--p) * 100%);
+  max-width: 100%;
+  border-radius: 5px;
+  background: linear-gradient(90deg, #FF7A2E 0%, #FFC247 72%, #FFF4D6 100%);
+  box-shadow: 0 0 10px rgba(255, 194, 71, 0.65);
+  transition: width 0.28s ease-out;
+}
+
+/* A little wick flame riding the tip of the progress bar. */
+#loading .bar i::after {
+  content: "";
+  position: absolute;
+  right: -5px;
+  bottom: 3px;
+  width: 10px;
+  height: 18px;
+  border-radius: 50% 50% 45% 45% / 62% 62% 38% 38%;
+  background: radial-gradient(55% 45% at 50% 70%, #FFF4D6 0%, #FFC247 45%, rgba(255, 122, 46, 0.85) 75%, rgba(255, 122, 46, 0) 100%);
+  filter: drop-shadow(0 0 5px rgba(255, 194, 71, 0.9));
+  transform-origin: 50% 100%;
+  animation: wick-flicker 1.3s ease-in-out infinite alternate;
+}
+
+#loading p {
+  order: 3;
+  margin: 0;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-style: italic;
+  font-size: 14px;
+  color: #3B2F22;
+}
+
+#loading.done {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  box-shadow: 0 18px 50px rgba(8, 5, 3, 0), 0 0 0 100vmax rgba(24, 15, 10, 0);
+  transition: opacity 0.45s ease, visibility 0s linear 0.45s, box-shadow 0.45s ease;
+}
+
+@keyframes wick-flicker {
+  0%   { transform: scale(1, 1) rotate(-2deg); opacity: 0.95; }
+  35%  { transform: scale(0.92, 1.08) rotate(2deg); opacity: 1; }
+  70%  { transform: scale(1.05, 0.94) rotate(-1deg); opacity: 0.9; }
+  100% { transform: scale(0.96, 1.04) rotate(1.5deg); opacity: 1; }
+}
+
+/* ------------------------------------------------------------------------------------------------
+   Headless mode (?headless=1): a full-page ledger of the invariant CSV.
+   ------------------------------------------------------------------------------------------------ */
+#headless-log {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 24px 28px;
+  overflow: auto;
+  white-space: pre;
+  font-family: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #1B1712;
+  background: radial-gradient(130% 110% at 50% 0%, #F7F1E3 0%, #EFE6D2 55%, #E2D5B8 100%);
+  border-left: 6px double #B08D57;
+  tab-size: 4;
+  user-select: text;
+}
+
+/* ------------------------------------------------------------------------------------------------
+   Renderer debug overlay ('P').
+   ------------------------------------------------------------------------------------------------ */
+#debug-overlay {
+  position: fixed;
+  left: 72px;
+  top: 56px;
+  z-index: 40;
+  margin: 0;
+  padding: 7px 10px;
+  min-width: 220px;
+  white-space: pre;
+  font-family: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #EFE6D2;
+  background: rgba(27, 23, 18, 0.84);
+  border: 1px solid #B08D57;
+  border-radius: 3px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+
+.noscript {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  margin: 0;
+  padding: 18px 24px;
+  font-family: Georgia, serif;
+  color: #1B1712;
+  background: #EFE6D2;
+  border: 1px solid #B08D57;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #loading .bar i::after { animation: none; }
+  #loading, #loading.done, #loading .bar i { transition-duration: 0s; }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "wickmarket",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Wickmarket: a candlelight voxel economy under glass. Autonomous agents, emergent markets, browser-native.",
+  "type": "module",
+  "scripts": {
+    "start": "node serve.mjs 5173",
+    "headless": "node scripts/headless.mjs --days 30"
+  }
+}

@@ -1,0 +1,592 @@
+// Deterministic terrain + structure generation (SPEC §C.4 G1 worldgen.js).
+// Same seed ⇒ identical bytes. Uses only createRng(seed) / createNoise(seed) / hash3.
+import { CONFIG, GOODS } from '../core/config.js';
+import { createRng, createNoise, hash3 } from '../core/rng.js';
+import { B, SOLID, houseTemplate, towerTemplate, treeTemplate } from './blocks.js';
+import { generateClanWorld } from './worldgenClans.js';
+
+// Column occupancy codes used while placing structures.
+const OCC_FREE = 0, OCC_PLAZA = 1, OCC_ROAD = 2, OCC_STRUCT = 3, OCC_CLEAR = 4, OCC_TREE = 5, OCC_BUSH = 6;
+const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+
+const smoothstep = (a, b, x) => {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+};
+const lerp = (a, b, t) => a + (b - a) * t;
+
+/**
+ * Generate the specimen into `world` and describe its landmarks.
+ * With two or more clans the island is split into clan sectors (worldgenClans.js).
+ * @param {import('./world.js').World} world
+ * @param {number} seed uint32
+ * @param {typeof CONFIG} config
+ * @param {object} [setup] normalized world setup (economy/clans.js normalizeSetup)
+ * @returns {object} WorldInfo (SPEC §C.2)
+ */
+export function generateWorld(world, seed, config = CONFIG, setup = null) {
+  if (setup && Array.isArray(setup.clans) && setup.clans.length > 1) return generateClanWorld(world, seed, config, setup);
+  const g = config.worldgen, W = config.world, P = config.production;
+  const rng = createRng(seed >>> 0);
+  const noise = createNoise(seed >>> 0);
+  const { SX, SY, SZ } = world;
+  const LAYER = SX * SZ;
+  const LEVEL = W.WATER_LEVEL;
+  const CX = W.CX, CZ = W.CZ;
+  const data = world.data;
+  data.fill(B.AIR);
+  world.footfall.fill(0);
+
+  const col = (x, z) => x + SX * z;
+  const idx = (x, y, z) => x + SX * (z + SZ * y);
+  const inside = (x, z) => world.isInside(x, z);
+  const rDist = (x, z) => Math.hypot(x + 0.5 - CX, z + 0.5 - CZ);
+  const pond = g.pond;
+  const pDist = (x, z) => Math.hypot(x + 0.5 - pond.x, z + 0.5 - pond.z);
+
+  // -------------------------------------------------------------------------
+  // 1. Heightmap
+  // -------------------------------------------------------------------------
+  const ridgeVal = new Float32Array(LAYER);
+  const Hf = new Float32Array(LAYER);
+  for (let z = 0; z < SZ; z++) {
+    for (let x = 0; x < SX; x++) {
+      const c = col(x, z);
+      const rv = noise.ridged2(x / 28, z / 28);
+      ridgeVal[c] = rv;
+      let h = g.baseHeight + g.hillAmp * noise.fbm2(x / 40, z / 40)
+        + g.ridgeAmp * rv * smoothstep(g.ridgeStartX - 10, g.ridgeStartX + 14, x);
+      const d = pDist(x, z);
+      if (d < pond.r) {
+        h = Math.min(h, LEVEL - 1 - pond.depth * (1 - d / pond.r) ** 2);
+      } else {
+        const t = (d - pond.r) / (g.pondBlend ?? 8);
+        if (t < 1) h = lerp(LEVEL, h, smoothstep(0, 1, t));
+        h = Math.max(h, LEVEL);
+      }
+      Hf[c] = h;
+    }
+  }
+  const H = new Int16Array(LAYER);
+  for (let c = 0; c < LAYER; c++) H[c] = Math.max(3, Math.min(SY - 14, Math.round(Hf[c])));
+
+  // Allowed step between neighbouring columns: 1, or 2 on the steep ridge crests.
+  const steep = new Uint8Array(LAYER);
+  for (let z = 0; z < SZ; z++) {
+    for (let x = 0; x < SX; x++) {
+      steep[col(x, z)] = x > g.ridgeStartX && ridgeVal[col(x, z)] > (g.ridgeSteepRidged ?? 0.7) ? 1 : 0;
+    }
+  }
+  const slopeOf = (a, b) => (steep[a] && steep[b] ? 2 : g.maxSlope);
+  const locked = new Uint8Array(LAYER);
+  relaxSlopes(H, locked, slopeOf, SX, SZ, false);
+
+  // Plazas: best-flat 9×9 near each configured site, clear of the pond and the rim.
+  const half = g.plazaHalf;
+  const plazas = g.marketSites.map((site, m) => choosePlaza(site, m));
+  function choosePlaza(site) {
+    let best = null;
+    for (let reach = g.siteJitter; reach <= g.siteJitter + 12 && !best; reach += 4) {
+      for (let dz = -reach; dz <= reach; dz++) {
+        for (let dx = -reach; dx <= reach; dx++) {
+          const cx = site.x + dx, cz = site.z + dz;
+          let ok = true, lo = Infinity, hi = -Infinity;
+          for (let z = cz - half; z <= cz + half && ok; z++) {
+            for (let x = cx - half; x <= cx + half; x++) {
+              if (!inside(x, z) || rDist(x, z) > g.rimStart - 4 || pDist(x, z) < pond.r + 3) { ok = false; break; }
+              const h = H[col(x, z)];
+              if (h < lo) lo = h;
+              if (h > hi) hi = h;
+            }
+          }
+          if (!ok) continue;
+          const score = (hi - lo) + 0.15 * Math.hypot(dx, dz) + 0.01 * hash3(cx, 0, cz, seed);
+          if (!best || score < best.score) best = { cx, cz, score };
+        }
+      }
+    }
+    if (!best) best = { cx: site.x, cz: site.z };
+    const hs = [];
+    for (let z = best.cz - half; z <= best.cz + half; z++) for (let x = best.cx - half; x <= best.cx + half; x++) hs.push(H[col(x, z)]);
+    hs.sort((a, b) => a - b);
+    const h = Math.max(LEVEL, hs[hs.length >> 1]);
+    for (let z = best.cz - half; z <= best.cz + half; z++) {
+      for (let x = best.cx - half; x <= best.cx + half; x++) { H[col(x, z)] = h; locked[col(x, z)] = 1; }
+    }
+    return { cx: best.cx, cz: best.cz, h };
+  }
+
+  // Road: a locked straight ramp between the plazas (Dewside → Sunward), 1 + 2·halfWidth wide.
+  const occ = new Uint8Array(LAYER);
+  for (const p of plazas) {
+    for (let z = p.cz - half; z <= p.cz + half; z++) for (let x = p.cx - half; x <= p.cx + half; x++) occ[col(x, z)] = OCC_PLAZA;
+  }
+  {
+    const a = plazas[1], b = plazas[0];
+    const len = Math.hypot(b.cx - a.cx, b.cz - a.cz);
+    const steps = Math.ceil(len * 3);
+    const rw = g.roadHalfWidth ?? 1;
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const x = Math.round(lerp(a.cx, b.cx, t)), z = Math.round(lerp(a.cz, b.cz, t));
+      const h = Math.round(lerp(a.h, b.h, t));
+      for (let dz = -rw; dz <= rw; dz++) {
+        for (let dx = -rw; dx <= rw; dx++) {
+          const xx = x + dx, zz = z + dz;
+          if (!inside(xx, zz)) continue;
+          const c = col(xx, zz);
+          if (occ[c] !== OCC_FREE) continue;
+          occ[c] = OCC_ROAD;
+          H[c] = h;
+          locked[c] = 1;
+        }
+      }
+    }
+  }
+  relaxSlopes(H, locked, slopeOf, SX, SZ, true);
+
+  // Dry pits below the water line that are not part of the pond are filled to the shore level.
+  {
+    const wet = new Uint8Array(LAYER);
+    const q = [col(Math.floor(pond.x), Math.floor(pond.z))];
+    if (H[q[0]] < LEVEL) wet[q[0]] = 1; else q.length = 0;
+    while (q.length) {
+      const c = q.pop();
+      const x = c % SX, z = (c / SX) | 0;
+      for (const [dx, dz] of DIRS) {
+        const nx = x + dx, nz = z + dz;
+        if (!inside(nx, nz)) continue;
+        const n = col(nx, nz);
+        if (!wet[n] && H[n] < LEVEL) { wet[n] = 1; q.push(n); }
+      }
+    }
+    for (let c = 0; c < LAYER; c++) if (H[c] < LEVEL && !wet[c]) H[c] = LEVEL;
+    // Rim: the basalt bowl rises at the jar wall.
+    for (let z = 0; z < SZ; z++) {
+      for (let x = 0; x < SX; x++) {
+        const r = rDist(x, z);
+        if (r > g.rimStart) H[col(x, z)] = Math.min(SY - 10, H[col(x, z)] + Math.round((r - g.rimStart) * 2));
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 2. Columns
+  // -------------------------------------------------------------------------
+  const [ldLo, ldHi] = g.loamDepth;
+  const [bog0, bog1] = g.bogRing;
+  for (let z = 0; z < SZ; z++) {
+    for (let x = 0; x < SX; x++) {
+      if (!inside(x, z)) continue;
+      const c = col(x, z);
+      const h = H[c];
+      const r = rDist(x, z);
+      data[idx(x, 0, z)] = B.BEDROCK;
+      const rim = r > g.rimStart;
+      const bare = !rim && steep[c] === 1;
+      const loamDepth = ldLo + Math.floor(hash3(x, 0, z, seed ^ 0x10A) * (ldHi - ldLo + 1));
+      const under = h < LEVEL;
+      const e = pDist(x, z) - pond.r;
+      const wobble = noise.noise2(x / 6 + 31.7, z / 6 - 12.3);
+      const bog = !under && !rim && e >= bog0 + wobble && e <= bog1 + 2 * wobble;
+      for (let y = 1; y <= h; y++) {
+        let id;
+        if (rim || bare) id = B.BASALT;
+        else if (y <= h - loamDepth) id = B.BASALT;
+        else if (y < h) id = B.LOAM;
+        else id = under ? B.LOAM : B.MOSS;
+        if (bog && y >= h - 1) id = B.PEAT;
+        data[idx(x, y, z)] = id;
+      }
+      if (occ[c] === OCC_PLAZA) data[idx(x, h, z)] = B.PAVING;
+      else if (occ[c] === OCC_ROAD) data[idx(x, h, z)] = B.PATH;
+      if (under) for (let y = h + 1; y <= LEVEL; y++) data[idx(x, y, z)] = B.WATER;
+    }
+  }
+
+  // Quartz veins in the ridge: lower the threshold until enough sits within reach of the surface.
+  {
+    const cells = [], vals = [], near = [];
+    const qMinX = g.quartzMinX ?? 60, nearDepth = g.quartzNearDepth ?? 12;
+    for (let z = 0; z < SZ; z++) {
+      for (let x = qMinX + 1; x < SX; x++) {
+        if (!inside(x, z) || rDist(x, z) > g.rimStart - 1) continue;
+        const c = col(x, z), h = H[c];
+        const nonRidge = x < g.ridgeStartX;
+        for (let y = 1; y <= h; y++) {
+          const i = idx(x, y, z);
+          if (data[i] !== B.BASALT) continue;
+          if (nonRidge && y > h - 2) continue;
+          cells.push(i);
+          vals.push(noise.noise3(x / 9, y / 9, z / 9));
+          near.push(y >= h - nearDepth ? 1 : 0);
+        }
+      }
+    }
+    let t = g.quartzVein;
+    const floorT = g.quartzVeinFloor ?? 0.4, need = g.quartzMinNear ?? 320;
+    for (;;) {
+      let n = 0;
+      for (let k = 0; k < cells.length; k++) if (near[k] && vals[k] > t) n++;
+      if (n >= need || t <= floorT) break;
+      t = Math.max(floorT, t - 0.03);
+    }
+    for (let k = 0; k < cells.length; k++) if (vals[k] > t) data[cells[k]] = B.QUARTZ;
+  }
+
+  // Amber: rare resin nodules deep in the basalt.
+  {
+    const maxY = g.amberMaxY ?? 14;
+    for (let y = 1; y < Math.min(maxY, SY); y++) {
+      for (let z = 0; z < SZ; z++) {
+        for (let x = 0; x < SX; x++) {
+          const i = idx(x, y, z);
+          if (data[i] === B.BASALT && hash3(x, y, z, seed ^ 0xA3BE) < g.amberChance) data[i] = B.AMBER;
+        }
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 3. Plaza furniture
+  // -------------------------------------------------------------------------
+  const MARKET_KEYS = ['sunward', 'dewside'];
+  const MARKET_NAMES = ['Sunward', 'Dewside'];
+  const markets = plazas.map((p, m) => {
+    const y = p.h + 1;
+    const kettles = [{ x: p.cx - 2, y, z: p.cz - 2 }, { x: p.cx + 2, y, z: p.cz + 2 }];
+    for (const k of kettles) data[idx(k.x, k.y, k.z)] = B.KETTLE;
+    // Eight pads spread around the plaza's perimeter (clockwise, skipping corners).
+    const rim = [];
+    const x0 = p.cx - half, x1 = p.cx + half, z0 = p.cz - half, z1 = p.cz + half;
+    for (let x = x0; x < x1; x++) rim.push([x, z0]);
+    for (let z = z0; z < z1; z++) rim.push([x1, z]);
+    for (let x = x1; x > x0; x--) rim.push([x, z1]);
+    for (let z = z1; z > z0; z--) rim.push([x0, z]);
+    const pads = {};
+    const stride = rim.length / GOODS.length;
+    GOODS.forEach((good, i) => {
+      const [px, pz] = rim[Math.floor(i * stride + stride / 2) % rim.length];
+      pads[good] = { x: px, y, z: pz };
+    });
+    return {
+      id: m, key: MARKET_KEYS[m] ?? `market${m}`, name: MARKET_NAMES[m] ?? `Market ${m}`, clan: 0,
+      center: { x: p.cx, y, z: p.cz },
+      plaza: { x0, z0, x1, z1, y },
+      kettles, pads,
+    };
+  });
+
+  // -------------------------------------------------------------------------
+  // 4. Reachability on the bare terrain
+  // -------------------------------------------------------------------------
+  let reach = bfsReach(world, markets[1].center);
+  const reachable = (x, y, z) => world.inBounds(x, y, z) && reach[idx(x, y, z)] === 1;
+  const surfaceReach = (x, z) => inside(x, z) && reachable(x, H[col(x, z)] + 1, z);
+  const occNear = (x, z, r, pred) => {
+    for (let dz = -r; dz <= r; dz++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const xx = x + dx, zz = z + dz;
+        if (xx < 0 || zz < 0 || xx >= SX || zz >= SZ) continue;
+        if (pred(occ[col(xx, zz)])) return true;
+      }
+    }
+    return false;
+  };
+  const place = blocks => { for (const b of blocks) if (world.inBounds(b.x, b.y, b.z)) data[idx(b.x, b.y, b.z)] = b.id; };
+  const airAt = (x, y, z) => world.inBounds(x, y, z) && data[idx(x, y, z)] === B.AIR;
+
+  // -------------------------------------------------------------------------
+  // 5a. Lens towers on the ridge
+  // -------------------------------------------------------------------------
+  const towers = [];
+  {
+    const T = P.tower;
+    const cands = [];
+    for (let z = 0; z < SZ; z++) {
+      for (let x = T.minX; x < SX; x++) {
+        if (!inside(x, z) || rDist(x, z) > g.rimStart - 2) continue;
+        const c = col(x, z);
+        if (occ[c] !== OCC_FREE || H[c] < LEVEL) continue;
+        if (markets.some(mk => Math.hypot(x - mk.center.x, z - mk.center.z) < (g.towerPlazaClear ?? 7))) continue;
+        const y = H[c] + 1;
+        let clear = true;
+        for (let k = 0; k < 5; k++) if (!airAt(x, y + k, z)) { clear = false; break; }
+        if (!clear) continue;
+        let stand = null;
+        for (const [dx, dz] of DIRS) {
+          const sx = x + dx, sz = z + dz;
+          if (!inside(sx, sz) || occ[col(sx, sz)] !== OCC_FREE) continue;
+          const sy = H[col(sx, sz)] + 1;
+          if (Math.abs(sy - y) <= 1 && reachable(sx, sy, sz)) { stand = { x: sx, y: sy, z: sz }; break; }
+        }
+        if (!stand) continue;
+        cands.push({ x, y, z, stand, score: H[c] + 3 * hash3(x, 7, z, seed) });
+      }
+    }
+    cands.sort((a, b) => b.score - a.score || a.x - b.x || a.z - b.z);
+    for (const spacing of [g.towerSpreadSpacing ?? 8, T.minSpacing]) {
+      for (const cd of cands) {
+        if (towers.length >= g.towers) break;
+        if (occ[col(cd.x, cd.z)] !== OCC_FREE || occ[col(cd.stand.x, cd.stand.z)] !== OCC_FREE) continue;
+        if (towers.some(t => Math.hypot(t.base.x - cd.x, t.base.z - cd.z) < spacing)) continue;
+        const tpl = towerTemplate(cd.x, cd.y, cd.z);
+        place(tpl.blocks);
+        occ[col(cd.x, cd.z)] = OCC_STRUCT;
+        occ[col(cd.stand.x, cd.stand.z)] = OCC_CLEAR;
+        towers.push({ id: towers.length + 1, base: tpl.base, lens: tpl.lens, stand: cd.stand, clan: 0 });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 5b. Cottages around the plazas (alternating markets)
+  // -------------------------------------------------------------------------
+  const houses = [];
+  {
+    const SOFT = new Set([B.MOSS, B.LOAM, B.PATH]);
+    const [r0, r1] = g.houseR ?? [5, 18];
+    const rFallback = g.houseRFallback ?? 26;
+    const siteOk = (x0, z0) => {
+      const h = H[col(x0, z0)];
+      for (let dz = 0; dz < 3; dz++) {
+        for (let dx = 0; dx < 3; dx++) {
+          const x = x0 + dx, z = z0 + dz;
+          if (!inside(x, z) || rDist(x, z) > g.rimStart - 2) return false;
+          const c = col(x, z);
+          if (H[c] !== h || occ[c] !== OCC_FREE) return false;
+          if (!SOFT.has(data[idx(x, h, z)])) return false;
+          for (let k = 1; k <= 4; k++) if (!airAt(x, h + k, z)) return false;
+        }
+      }
+      // 1-cell margin free of structures, plazas and keep-clear cells.
+      for (let z = z0 - 1; z <= z0 + 3; z++) {
+        for (let x = x0 - 1; x <= x0 + 3; x++) {
+          if (x < 0 || z < 0 || x >= SX || z >= SZ) return false;
+          const o = occ[col(x, z)];
+          if (o === OCC_STRUCT || o === OCC_PLAZA || o === OCC_CLEAR) return false;
+        }
+      }
+      const ax = x0 + 1, az = z0 - 1;
+      if (!inside(ax, az)) return false;
+      const ao = occ[col(ax, az)];
+      if (ao === OCC_STRUCT || ao === OCC_PLAZA) return false;
+      return reachable(ax, h + 1, az);
+    };
+    for (let i = 0; i < g.houses; i++) {
+      const mk = markets[i % markets.length];
+      let site = null;
+      for (const [lo, hi] of [[r0, r1], [r0, rFallback]]) {
+        const cands = [];
+        for (let z0 = mk.center.z - hi - 2; z0 <= mk.center.z + hi; z0++) {
+          for (let x0 = mk.center.x - hi - 2; x0 <= mk.center.x + hi; x0++) {
+            const d = Math.hypot(x0 + 1 - mk.center.x, z0 + 1 - mk.center.z);
+            if (d >= lo && d <= hi) cands.push([x0, z0, d]);
+          }
+        }
+        // Prefer sites nearer the plaza, with deterministic jitter.
+        cands.sort((a, b) => (a[2] + 6 * hash3(a[0], 3, a[1], seed)) - (b[2] + 6 * hash3(b[0], 3, b[1], seed)));
+        for (const [x0, z0] of cands) if (siteOk(x0, z0)) { site = [x0, z0]; break; }
+        if (site) break;
+      }
+      if (!site) continue;
+      const [x0, z0] = site;
+      const y0 = H[col(x0, z0)] + 1;
+      const tpl = houseTemplate(x0, y0, z0);
+      place(tpl.blocks);
+      for (let dz = 0; dz < 3; dz++) for (let dx = 0; dx < 3; dx++) occ[col(x0 + dx, z0 + dz)] = OCC_STRUCT;
+      if (occ[col(x0 + 1, z0 - 1)] === OCC_FREE) occ[col(x0 + 1, z0 - 1)] = OCC_CLEAR;
+      houses.push({ id: houses.length + 1, ...tpl, marketId: mk.id, clan: 0 });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 5c. Resinpine groves (Poisson rejection sampling on moss)
+  // -------------------------------------------------------------------------
+  const trees = [];
+  {
+    const spacing = g.treeSpacing ?? 4;
+    const [hLo, hHi] = P.treeHeight ?? [4, 7];
+    const blocked = o => o === OCC_STRUCT || o === OCC_PLAZA || o === OCC_ROAD || o === OCC_CLEAR;
+    for (let attempt = 0; attempt < 6000 && trees.length < g.trees; attempt++) {
+      const x = rng.int(2, SX - 3), z = rng.int(2, SZ - 3);
+      if (!inside(x, z) || rDist(x, z) > g.rimStart - 3) continue;
+      const c = col(x, z);
+      if (data[idx(x, H[c], z)] !== B.MOSS) continue;
+      const grove = 0.3 + 0.7 * smoothstep(-0.25, 0.35, noise.fbm2(x / (g.groveScale ?? 22) + 101.3, z / (g.groveScale ?? 22) - 47.1, 3));
+      if (rng.next() > grove) continue;
+      if (occNear(x, z, 2, blocked)) continue;
+      if (trees.some(t => Math.hypot(t.x - x, t.z - z) < spacing)) continue;
+      const y = H[c] + 1;
+      const height = rng.int(hLo, hHi);
+      const tpl = treeTemplate(x, y, z, height);
+      if (!tpl.blocks.every(b => inside(b.x, b.z) && airAt(b.x, b.y, b.z))) continue;
+      if (!DIRS.some(([dx, dz]) => surfaceReach(x + dx, z + dz))) continue;
+      place(tpl.blocks);
+      occ[c] = OCC_TREE;
+      trees.push({ x, y, z, height });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 5d. Waxberry bushes (mostly around the pond)
+  // -------------------------------------------------------------------------
+  const bushes = [];
+  {
+    const band = g.bushPondBand ?? 14;
+    const nearFrac = g.bushNearPondFrac ?? 0.7;
+    const ripeFrac = g.bushRipeFrac ?? 0.7;
+    const blocked = o => o !== OCC_FREE && o !== OCC_BUSH;
+    for (let attempt = 0; attempt < 12000 && bushes.length < g.bushes; attempt++) {
+      let x, z;
+      if (rng.next() < nearFrac) {
+        const a = rng.range(0, Math.PI * 2), d = pond.r + rng.range(0, band);
+        x = Math.floor(pond.x + Math.cos(a) * d); z = Math.floor(pond.z + Math.sin(a) * d);
+      } else {
+        x = rng.int(2, SX - 3); z = rng.int(2, SZ - 3);
+      }
+      if (!inside(x, z) || rDist(x, z) > g.rimStart - 2) continue;
+      const c = col(x, z);
+      if (occ[c] !== OCC_FREE || data[idx(x, H[c], z)] !== B.MOSS) continue;
+      if (occNear(x, z, 1, blocked)) continue;
+      const y = H[c] + 1;
+      if (!airAt(x, y, z) || !airAt(x, y + 1, z)) continue;
+      if (!DIRS.some(([dx, dz]) => surfaceReach(x + dx, z + dz) && occ[col(x + dx, z + dz)] !== OCC_BUSH)) continue;
+      const ripe = rng.next() < ripeFrac;
+      data[idx(x, y, z)] = ripe ? B.BUSH_RIPE : B.BUSH_BARE;
+      occ[c] = OCC_BUSH;
+      bushes.push({ x, y, z, ripe });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 6. Final reachability audit + spawn cells
+  // -------------------------------------------------------------------------
+  world.recomputeDerived();
+  reach = bfsReach(world, markets[1].center);
+  if (!reachable(markets[0].center.x, markets[0].center.y, markets[0].center.z)) {
+    console.warn('[worldgen] Sunward plaza is not reachable from Dewside for seed', seed.toString(16));
+  }
+  // Drop any structure whose working cell ended up unreachable (never observed, but cheap insurance).
+  const keptTowers = [];
+  for (const t of towers) {
+    if (reachable(t.stand.x, t.stand.y, t.stand.z)) keptTowers.push(t);
+    else for (const b of towerTemplate(t.base.x, t.base.y, t.base.z).blocks) data[idx(b.x, b.y, b.z)] = B.AIR;
+  }
+  const keptHouses = [];
+  for (const h of houses) {
+    if (reachable(h.approach.x, h.approach.y, h.approach.z)) keptHouses.push(h);
+    else for (const b of h.blocks) data[idx(b.x, b.y, b.z)] = B.AIR;
+  }
+  if (keptTowers.length !== towers.length || keptHouses.length !== houses.length) {
+    world.recomputeDerived();
+    reach = bfsReach(world, markets[1].center);
+  }
+  keptTowers.forEach((t, i) => { t.id = i + 1; });
+  keptHouses.forEach((h, i) => { h.id = i + 1; });
+
+  const spawnCells = [];
+  const spawnR = g.spawnR ?? 12;
+  for (const mk of markets) {
+    for (let z = mk.center.z - spawnR; z <= mk.center.z + spawnR; z++) {
+      for (let x = mk.center.x - spawnR; x <= mk.center.x + spawnR; x++) {
+        if (!inside(x, z) || Math.hypot(x - mk.center.x, z - mk.center.z) > spawnR) continue;
+        const y = world.heightmap[col(x, z)] + 1;
+        if (reachable(x, y, z) && world.isWalkable(x, y, z)) spawnCells.push({ x, y, z });
+      }
+    }
+  }
+
+  world.markAllDirty();
+
+  const pondInfo = { x: pond.x, z: pond.z, r: pond.r, level: LEVEL };
+  return {
+    seed: seed >>> 0,
+    clanCount: 1,
+    markets,
+    towers: keptTowers,
+    houses: keptHouses,
+    trees,
+    bushes,
+    pond: pondInfo,
+    ponds: [pondInfo],
+    spawnCells,
+    spawnByClan: [spawnCells],
+    sectorMap: null,
+    wallLines: [],
+  };
+}
+
+/**
+ * Enforce |Δh| ≤ slope between 4-neighbours by repeated forward/backward passes.
+ * Pass 1 only lowers (min-propagation). With `raise`, unlocked cells are also lifted toward
+ * higher locked neighbours so plazas and the road blend into the terrain.
+ */
+export function relaxSlopes(H, locked, slopeOf, SX, SZ, raise) {
+  for (let iter = 0; iter < 64; iter++) {
+    let changed = false;
+    for (let pass = 0; pass < 2; pass++) {
+      const fwd = pass === 0;
+      for (let zi = 0; zi < SZ; zi++) {
+        const z = fwd ? zi : SZ - 1 - zi;
+        for (let xi = 0; xi < SX; xi++) {
+          const x = fwd ? xi : SX - 1 - xi;
+          const c = x + SX * z;
+          if (locked[c]) continue;
+          let h = H[c];
+          const nbrs = fwd ? [[x - 1, z], [x, z - 1]] : [[x + 1, z], [x, z + 1]];
+          for (const [nx, nz] of nbrs) {
+            if (nx < 0 || nz < 0 || nx >= SX || nz >= SZ) continue;
+            const n = nx + SX * nz, s = slopeOf(c, n);
+            if (h > H[n] + s) h = H[n] + s;
+            if (raise && h < H[n] - s) h = H[n] - s;
+          }
+          if (h !== H[c]) { H[c] = h; changed = true; }
+        }
+      }
+    }
+    if (!changed) break;
+  }
+}
+
+/**
+ * Flood-fill walkable foot cells from `start` using the pathfinder's move rules
+ * (4 directions, step ±1; the lower column needs clearance at feet+2).
+ * @returns {Uint8Array} 1 = reachable foot cell
+ */
+export function bfsReach(world, start) {
+  const { SX, SY, SZ } = world;
+  const seen = new Uint8Array(SX * SY * SZ);
+  const idx = (x, y, z) => x + SX * (z + SZ * y);
+  if (!world.isWalkable(start.x, start.y, start.z)) return seen;
+  let queue = new Int32Array(SX * SZ * 4);
+  let head = 0, tail = 0;
+  const push = (x, y, z) => {
+    const i = idx(x, y, z);
+    if (seen[i]) return;
+    seen[i] = 1;
+    if (tail >= queue.length) {
+      const bigger = new Int32Array(queue.length * 2);
+      bigger.set(queue);
+      queue = bigger;
+    }
+    queue[tail++] = i;
+  };
+  push(start.x, start.y, start.z);
+  const layer = SX * SZ;
+  while (head < tail) {
+    const i = queue[head++];
+    const y = (i / layer) | 0, rem = i - y * layer, z = (rem / SX) | 0, x = rem - z * SX;
+    for (const [dx, dz] of DIRS) {
+      const nx = x + dx, nz = z + dz;
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = y + dy;
+        if (!world.isWalkable(nx, ny, nz)) continue;
+        if (dy === 1 && !world.isPassableAt(x, y + 2, z)) continue;
+        if (dy === -1 && !world.isPassableAt(nx, y + 1, nz)) continue;
+        push(nx, ny, nz);
+      }
+    }
+  }
+  return seen;
+}
